@@ -1,0 +1,104 @@
+############# set region and zone #############
+gcloud config set compute/region asia-south1
+gcloud config set compute/zone asia-south1-a
+
+############# create vpc #############
+gcloud compute networks create kubernetes-cluster --subnet-mode custom
+############# create subnet #############
+gcloud compute networks subnets create kubernetes --network kubernetes-cluster --range 10.240.0.0/24
+############# create fw-rules for vpc #############   ------> flawed, need to relook
+gcloud compute firewall-rules create kubernetes-cluster-allow-internal --allow tcp,udp,icmp --network kubernetes-cluster \
+--source-ranges 0.0.0.0/0
+#  --source-ranges 10.240.0.0/24,10.244.0.0/16
+############# reserve a public ip #############
+gcloud compute addresses create kubernetes-controller --region $(gcloud config get-value compute/region)
+############# fetch the reserved public ip #############
+PUBLIC_IP=$(gcloud compute addresses describe kubernetes-controller --region $(gcloud config get-value compute/region) --format 'value(address)')
+############# Create control plane vm #############
+gcloud compute instances create controller \
+    --async \
+    --boot-disk-size=200GB \
+    --can-ip-forward \
+    --image-family=ubuntu-1804-lts \
+    --image-project=ubuntu-os-cloud \
+    --machine-type=n1-standard-1 \
+    --private-network-ip=10.240.0.10 \
+    --scopes=compute-rw,storage-ro,service-management,service-control,logging-write,monitoring \
+    --subnet=kubernetes \
+    --address=$PUBLIC_IP
+
+gcloud compute instances create controller --async --boot-disk-size=200GB --can-ip-forward --image-family=ubuntu-1804-lts --image-project=ubuntu-os-cloud  --machine-type=n1-standard-1 --private-network-ip=10.240.0.10 --subnet=kubernetes --address=$PUBLIC_IP --scopes=compute-rw,storage-ro,service-management,service-control,logging-write,monitoring
+############# Create worker nodes vm #############
+for i in 0 1; do \
+  gcloud compute instances create worker-${i} \
+    --async \
+    --boot-disk-size 200GB \
+    --can-ip-forward \
+    --image-family ubuntu-1804-lts \
+    --image-project ubuntu-os-cloud \
+    --machine-type n1-standard-1 \
+    --private-network-ip 10.240.0.2${i} \
+    --scopes compute-rw,storage-ro,service-management,service-control,logging-write,monitoring \
+    --subnet kubernetes; \
+done
+
+############# configure all nodes #############  ---> run tmux
+sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+apt-cache madison docker-ce
+sudo apt-get update && sudo apt-get install -y docker-ce=5:19.03.12~3-0~ubuntu-bionic docker-ce-cli=5:19.03.12~3-0~ubuntu-bionic
+sudo apt-mark hold containerd.io docker-ce docker-ce-cli
+cat <<EOF | sudo tee /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },
+  "storage-driver": "overlay2"
+}
+EOF
+sudo mkdir -p /etc/systemd/system/docker.service.d
+sudo systemctl daemon-reload
+sudo systemctl restart docker
+sudo systemctl enable docker
+
+curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | sudo apt-key add -
+cat <<EOF | sudo tee /etc/apt/sources.list.d/kubernetes.list
+deb https://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+sudo apt-get update
+apt-cache madison kubeadm
+sudo apt-get install -y kubelet=1.18.6-00 kubeadm=1.18.6-00 kubectl=1.18.6-00
+sudo apt-mark hold kubelet kubeadm kubectl
+############# configure master #############
+gcloud compute ssh controller
+gcloud config set compute/zone asia-south1-a
+
+KUBERNETES_PUBLIC_ADDRESS=$(gcloud compute instances describe controller \
+  --zone $(gcloud config get-value compute/zone) \
+  --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+sudo kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \
+  --ignore-preflight-errors=NumCPU \
+  --apiserver-cert-extra-sans=$KUBERNETES_PUBLIC_ADDRESS
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+kubectl apply -f https://docs.projectcalico.org/manifests/calico.yaml
+kubectl get pods -A
+kubectl get nodes
+
+############# clean-up #############
+for i in controller worker-0 worker-1; do \
+  gcloud compute instances delete ${i} --delete-disks=all --quiet; \
+done
+gcloud compute instances delete controller --delete-disks=all --quiet;
+gcloud compute instances delete worker-0 --delete-disks=all --quiet;
+gcloud compute instances delete worker-1 --delete-disks=all --quiet;
+
+gcloud compute addresses delete kubernetes-controller --quiet
+gcloud compute firewall-rules delete kubernetes-cluster-allow-internal --quiet
+gcloud compute networks subnets delete kubernetes --quiet
